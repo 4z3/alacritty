@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
-use glutin::dpi::PhysicalSize;
+use glutin::dpi::{PhysicalPosition, PhysicalSize};
 use glutin::event::{
     ElementState, Event as GlutinEvent, Ime, ModifiersState, MouseButton, StartCause, WindowEvent,
 };
@@ -184,6 +184,7 @@ pub struct ActionContext<'a, N, T> {
     pub terminal: &'a mut Term<T>,
     pub clipboard: &'a mut Clipboard,
     pub mouse: &'a mut Mouse,
+    pub touchscreen: &'a mut Touchscreen,
     pub received_count: &'a mut usize,
     pub suppress_chars: &'a mut bool,
     pub modifiers: &'a mut ModifiersState,
@@ -334,6 +335,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn mouse(&self) -> &Mouse {
         self.mouse
+    }
+
+    #[inline]
+    fn touchscreen_mut(&mut self) -> &mut Touchscreen {
+        self.touchscreen
+    }
+
+    #[inline]
+    fn touchscreen(&self) -> &Touchscreen {
+        self.touchscreen
     }
 
     #[inline]
@@ -1022,6 +1033,77 @@ pub enum ClickState {
     TripleClick,
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct TouchFinger {
+    pub start_x: f64,
+    pub start_y: f64,
+    pub start_timestamp: Instant,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum Gesture {
+    None,
+    Clicking,
+    Scrolling,
+    Zooming { start_finger_distance: f64, old_zoom: i64 },
+    Selecting,
+}
+
+#[derive(Debug)]
+pub struct Touchscreen {
+    pub fingers: HashMap<u64, TouchFinger>,
+    pub gesture: Gesture,
+}
+
+impl Default for Touchscreen {
+    fn default() -> Touchscreen {
+        Touchscreen { fingers: HashMap::new(), gesture: Gesture::None }
+    }
+}
+
+impl Touchscreen {
+    pub fn mean_finger_distance(&self) -> f64 {
+        let mut mean_distance = 0.0;
+        let mut pair_count = 0;
+        for (i, finger_a) in self.fingers.values().enumerate() {
+            for finger_b in self.fingers.values().skip(i + 1) {
+                pair_count += 1;
+                mean_distance += (finger_a.x - finger_b.x).hypot(finger_a.y - finger_b.y);
+            }
+        }
+        mean_distance / pair_count as f64
+    }
+
+    pub fn set_finger(&mut self, id: u64, location: &PhysicalPosition<f64>) -> TouchFinger {
+        *(self
+            .fingers
+            .entry(id)
+            .and_modify(|finger| {
+                finger.delta_x = location.x - finger.x;
+                finger.delta_y = location.y - finger.y;
+                finger.x = location.x;
+                finger.y = location.y;
+            })
+            .or_insert(TouchFinger {
+                start_x: location.x,
+                start_y: location.y,
+                start_timestamp: Instant::now(),
+                delta_x: 0.0,
+                delta_y: 0.0,
+                x: location.x,
+                y: location.y,
+            }))
+    }
+
+    pub fn new_zoom_gesture(&self) -> Gesture {
+        Gesture::Zooming { start_finger_distance: self.mean_finger_distance(), old_zoom: 0 }
+    }
+}
+
 /// State of the mouse.
 #[derive(Debug)]
 pub struct Mouse {
@@ -1203,6 +1285,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.ctx.window().set_mouse_visible(true);
                         self.mouse_wheel_input(delta, phase);
                     },
+                    WindowEvent::Touch(touch) => {
+                        self.ctx.window().set_mouse_visible(false);
+                        self.touch_input(touch);
+                    },
                     WindowEvent::Focused(is_focused) => {
                         self.ctx.terminal.is_focused = is_focused;
 
@@ -1275,7 +1361,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     | WindowEvent::Destroyed
                     | WindowEvent::ThemeChanged(_)
                     | WindowEvent::HoveredFile(_)
-                    | WindowEvent::Touch(_)
                     | WindowEvent::Moved(_) => (),
                 }
             },
@@ -1549,7 +1634,6 @@ impl Processor {
                     | WindowEvent::HoveredFileCancelled
                     | WindowEvent::Destroyed
                     | WindowEvent::HoveredFile(_)
-                    | WindowEvent::Touch(_)
                     | WindowEvent::Moved(_)
             ),
             GlutinEvent::Suspended { .. }

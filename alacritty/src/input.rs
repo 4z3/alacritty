@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use glutin::dpi::PhysicalPosition;
 use glutin::event::{
-    ElementState, KeyboardInput, ModifiersState, MouseButton, MouseScrollDelta, TouchPhase,
+    ElementState, KeyboardInput, ModifiersState, MouseButton, MouseScrollDelta, Touch, TouchPhase,
 };
 use glutin::event_loop::EventLoopWindowTarget;
 #[cfg(target_os = "macos")]
@@ -35,7 +35,9 @@ use crate::config::{Action, BindingMode, Key, MouseAction, SearchAction, UiConfi
 use crate::display::hint::HintMatch;
 use crate::display::window::Window;
 use crate::display::{Display, SizeInfo};
-use crate::event::{ClickState, Event, EventType, Mouse, TYPING_SEARCH_DELAY};
+use crate::event::{
+    ClickState, Event, EventType, Gesture, Mouse, TouchFinger, Touchscreen, TYPING_SEARCH_DELAY,
+};
 use crate::message_bar::{self, Message};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 
@@ -72,6 +74,8 @@ pub trait ActionContext<T: EventListener> {
     fn selection_is_empty(&self) -> bool;
     fn mouse_mut(&mut self) -> &mut Mouse;
     fn mouse(&self) -> &Mouse;
+    fn touchscreen_mut(&mut self) -> &mut Touchscreen;
+    fn touchscreen(&self) -> &Touchscreen;
     fn received_count(&mut self) -> &mut usize;
     fn suppress_chars(&mut self) -> &mut bool;
     fn modifiers(&mut self) -> &mut ModifiersState;
@@ -650,6 +654,97 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
+    pub fn touch_input(&mut self, touch: Touch) {
+        let finger = self.ctx.touchscreen_mut().set_finger(touch.id, &touch.location);
+        match touch.phase {
+            TouchPhase::Started => self.on_touch_start(),
+            TouchPhase::Moved => self.on_touch_move(finger),
+            TouchPhase::Ended | TouchPhase::Cancelled => self.on_touch_end(finger, touch.id),
+        }
+    }
+
+    pub fn on_touch_start(&mut self) {
+        self.ctx.touchscreen_mut().gesture = match self.ctx.touchscreen().gesture {
+            Gesture::None => Gesture::Clicking,
+            Gesture::Clicking | Gesture::Scrolling | Gesture::Zooming { .. } => {
+                self.ctx.touchscreen().new_zoom_gesture()
+            },
+            remaining => remaining,
+        };
+    }
+
+    pub fn on_touch_move(&mut self, finger: TouchFinger) {
+        match self.ctx.touchscreen().gesture {
+            Gesture::None => {},
+            Gesture::Clicking => {
+                // Allow a click despite wobbling fingers.
+                const Y_DISTANCE_FOR_TRANSFORMATION: f64 = 16.0;
+                const X_DISTANCE_FOR_SELECTING: f64 = 24.0;
+                if (finger.y - finger.start_y).abs() > Y_DISTANCE_FOR_TRANSFORMATION {
+                    self.scroll_terminal(finger.y - finger.start_y);
+                    self.ctx.touchscreen_mut().gesture = Gesture::Scrolling
+                } else if (finger.x - finger.start_x).abs() > X_DISTANCE_FOR_SELECTING {
+                    self.mouse_moved(PhysicalPosition::new(finger.start_x, finger.start_y));
+                    self.mouse_input(ElementState::Pressed, MouseButton::Left);
+                    self.mouse_moved(PhysicalPosition::new(finger.x, finger.y));
+                    self.ctx.touchscreen_mut().gesture = Gesture::Selecting
+                }
+            },
+            Gesture::Scrolling => self.scroll_terminal(finger.delta_y),
+            Gesture::Selecting => self.mouse_moved(PhysicalPosition::new(finger.x, finger.y)),
+            Gesture::Zooming { start_finger_distance, old_zoom } => {
+                let finger_distance = self.ctx.touchscreen().mean_finger_distance();
+                // Indicates the factor by how much greater the finger distance must be in relation
+                // to the last registered zoom level in order to trigger a further zoom level.
+                const FACTOR_PER_ZOOM_LEVEL: f64 = 1.05;
+                let new_zoom = (finger_distance / start_finger_distance)
+                    .log(FACTOR_PER_ZOOM_LEVEL)
+                    .round() as i64;
+                self.ctx.change_font_size((new_zoom as f32 - old_zoom as f32) * FONT_SIZE_STEP);
+                self.ctx.touchscreen_mut().gesture =
+                    Gesture::Zooming { start_finger_distance, old_zoom: new_zoom };
+            },
+        };
+    }
+
+    pub fn on_touch_end(&mut self, finger: TouchFinger, finger_id: u64) {
+        self.ctx.touchscreen_mut().fingers.remove(&finger_id);
+        match self.ctx.touchscreen().gesture {
+            Gesture::None => {},
+            Gesture::Clicking => {
+                const DURATION_FOR_RIGHT_CLICK: Duration = std::time::Duration::from_millis(300);
+                let touch_duration = Instant::now() - finger.start_timestamp;
+                let mouse_button = if touch_duration < DURATION_FOR_RIGHT_CLICK {
+                    MouseButton::Left
+                } else {
+                    MouseButton::Right
+                };
+                self.mouse_moved(PhysicalPosition::new(finger.start_x, finger.start_y));
+                // Do not simulate mouse clicks until you release your finger in order to
+                // prevent incorrect clicks during gestures.
+                self.mouse_input(ElementState::Pressed, mouse_button);
+                self.mouse_input(ElementState::Released, mouse_button);
+            },
+            Gesture::Selecting => {
+                if self.ctx.touchscreen().fingers.is_empty() {
+                    self.mouse_moved(PhysicalPosition::new(finger.x, finger.y));
+                    self.mouse_input(ElementState::Released, MouseButton::Left);
+                }
+            },
+            Gesture::Scrolling => self.scroll_terminal(finger.delta_y),
+            Gesture::Zooming { .. } => {
+                self.ctx.touchscreen_mut().gesture = if self.ctx.touchscreen().fingers.len() >= 2 {
+                    self.ctx.touchscreen().new_zoom_gesture()
+                } else {
+                    Gesture::Scrolling
+                }
+            },
+        };
+        if self.ctx.touchscreen().fingers.is_empty() {
+            self.ctx.touchscreen_mut().gesture = Gesture::None;
+        }
+    }
+
     fn scroll_terminal(&mut self, new_scroll_px: f64) {
         let height = f64::from(self.ctx.size_info().cell_height());
 
@@ -1008,6 +1103,7 @@ mod tests {
         pub terminal: &'a mut Term<T>,
         pub size_info: &'a SizeInfo,
         pub mouse: &'a mut Mouse,
+        pub touchscreen: &'a mut Touchscreen,
         pub clipboard: &'a mut Clipboard,
         pub message_buffer: &'a mut MessageBuffer,
         pub received_count: usize,
@@ -1066,6 +1162,16 @@ mod tests {
         #[inline]
         fn mouse(&self) -> &Mouse {
             self.mouse
+        }
+
+        #[inline]
+        fn touchscreen_mut(&mut self) -> &mut Touchscreen {
+            self.touchscreen
+        }
+
+        #[inline]
+        fn touchscreen(&self) -> &Touchscreen {
+            self.touchscreen
         }
 
         fn received_count(&mut self) -> &mut usize {
@@ -1145,9 +1251,12 @@ mod tests {
 
                 let mut message_buffer = MessageBuffer::default();
 
+                let mut touchscreen = Touchscreen::default();
+
                 let context = ActionContext {
                     terminal: &mut terminal,
                     mouse: &mut mouse,
+                    touchscreen: &mut touchscreen,
                     size_info: &size,
                     clipboard: &mut clipboard,
                     received_count: 0,

@@ -634,10 +634,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let multiplier = self.ctx.config().terminal_config.scrolling.multiplier;
         match delta {
             MouseScrollDelta::LineDelta(_columns, lines) => {
                 let new_scroll_px = lines * self.ctx.size_info().cell_height();
-                self.scroll_terminal(f64::from(new_scroll_px));
+                self.scroll_terminal(f64::from(new_scroll_px), f64::from(multiplier));
             },
             MouseScrollDelta::PixelDelta(lpos) => {
                 match phase {
@@ -646,7 +647,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                         self.ctx.mouse_mut().scroll_px = 0.;
                     },
                     TouchPhase::Moved => {
-                        self.scroll_terminal(lpos.y);
+                        self.scroll_terminal(lpos.y, f64::from(multiplier));
                     },
                     _ => (),
                 }
@@ -681,7 +682,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 const Y_DISTANCE_FOR_TRANSFORMATION: f64 = 16.0;
                 const X_DISTANCE_FOR_SELECTING: f64 = 24.0;
                 if (finger.y - finger.start_y).abs() > Y_DISTANCE_FOR_TRANSFORMATION {
-                    self.scroll_terminal(finger.y - finger.start_y);
+                    self.scroll_terminal(finger.y - finger.start_y, 1.0);
                     self.ctx.touchscreen_mut().gesture = Gesture::Scrolling
                 } else if (finger.x - finger.start_x).abs() > X_DISTANCE_FOR_SELECTING {
                     self.mouse_moved(PhysicalPosition::new(finger.start_x, finger.start_y));
@@ -690,7 +691,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                     self.ctx.touchscreen_mut().gesture = Gesture::Selecting
                 }
             },
-            Gesture::Scrolling => self.scroll_terminal(finger.delta_y),
+            Gesture::Scrolling => self.scroll_terminal(finger.delta_y, 1.0),
             Gesture::Selecting => self.mouse_moved(PhysicalPosition::new(finger.x, finger.y)),
             Gesture::Zooming { start_finger_distance, old_zoom } => {
                 let finger_distance = self.ctx.touchscreen().mean_finger_distance();
@@ -731,7 +732,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                     self.mouse_input(ElementState::Released, MouseButton::Left);
                 }
             },
-            Gesture::Scrolling => self.scroll_terminal(finger.delta_y),
+            Gesture::Scrolling => self.scroll_terminal(finger.delta_y, 1.0),
             Gesture::Zooming { .. } => {
                 self.ctx.touchscreen_mut().gesture = if self.ctx.touchscreen().fingers.len() >= 2 {
                     self.ctx.touchscreen().new_zoom_gesture()
@@ -745,7 +746,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
-    fn scroll_terminal(&mut self, new_scroll_px: f64) {
+    fn scroll_terminal(&mut self, new_scroll_px: f64, multiplier: f64) {
         let height = f64::from(self.ctx.size_info().cell_height());
 
         if self.ctx.mouse_mode() {
@@ -764,7 +765,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
             && !self.ctx.modifiers().shift()
         {
-            let multiplier = f64::from(self.ctx.config().terminal_config.scrolling.multiplier);
             self.ctx.mouse_mut().scroll_px += new_scroll_px * multiplier;
 
             let cmd = if new_scroll_px > 0. { b'A' } else { b'B' };
@@ -778,7 +778,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
             self.ctx.write_to_pty(content);
         } else {
-            let multiplier = f64::from(self.ctx.config().terminal_config.scrolling.multiplier);
             self.ctx.mouse_mut().scroll_px += new_scroll_px * multiplier;
 
             let lines = (self.ctx.mouse().scroll_px / height) as i32;
